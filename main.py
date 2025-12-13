@@ -8,11 +8,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ============================================================
-#                     ЛОГГЕР
-# ============================================================
 
-
+# ============================================================
+# ЛОГГЕР
+# ============================================================
 def log_info(message: str) -> None:
     print(f"\033[92m[INFO]\033[0m {message}")
 
@@ -26,9 +25,8 @@ def log_error(message: str) -> None:
 
 
 # ============================================================
-#                     .ENV
+# .ENV
 # ============================================================
-
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
@@ -37,41 +35,41 @@ GITHUB_USERNAME = os.getenv("GITHUB_USERNAME")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 
-if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID in .env")
+if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, GITHUB_TOKEN, GITHUB_USERNAME]):
+    raise RuntimeError("Missing required env variables in .env")
 
-if not GITHUB_TOKEN or not GITHUB_USERNAME:
-    raise RuntimeError("Missing GITHUB_TOKEN or GITHUB_USERNAME in .env")
+log_info(f"Config loaded: user={GITHUB_USERNAME}")
+
 
 # ============================================================
-#                     STATE
+# STATE
 # ============================================================
-
-
 def load_state() -> Dict[str, Any]:
     if not os.path.exists(STATE_FILE):
+        log_info("No state file found, starting fresh")
         return {"last_event_id": None, "repos": []}
 
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
-        log_warn("State file corrupted — resetting.")
+    except Exception as e:
+        log_warn(f"State file corrupted ({e}) — resetting.")
         return {"last_event_id": None, "repos": []}
 
 
 def save_state(state: Dict[str, Any]) -> None:
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log_error(f"Failed to save state: {e}")
 
 
 # ============================================================
-#                     GITHUB API
+# GITHUB API
 # ============================================================
-
-
 async def fetch_github_events(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
-    url = f"https://api.github.com/users/{GITHUB_USERNAME}/events"
+    url = f"https://api.github.com/users/{GITHUB_USERNAME}/events?per_page=30"
     headers = {
         "Accept": "application/vnd.github+json",
         "Authorization": f"token {GITHUB_TOKEN}",
@@ -79,12 +77,14 @@ async def fetch_github_events(session: aiohttp.ClientSession) -> List[Dict[str, 
     }
     async with session.get(url, headers=headers) as resp:
         if resp.status != 200:
+            text = await resp.text()
+            log_error(f"GitHub events API error {resp.status}: {text[:200]}")
             raise RuntimeError(f"GitHub events API error: {resp.status}")
         return await resp.json()
 
 
 async def fetch_user_repos(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
-    url = f"https://api.github.com/users/{GITHUB_USERNAME}/repos?per_page=100"
+    url = f"https://api.github.com/users/{GITHUB_USERNAME}/repos?per_page=100&sort=updated"
     headers = {
         "Accept": "application/vnd.github+json",
         "Authorization": f"token {GITHUB_TOKEN}",
@@ -92,15 +92,15 @@ async def fetch_user_repos(session: aiohttp.ClientSession) -> List[Dict[str, Any
     }
     async with session.get(url, headers=headers) as resp:
         if resp.status != 200:
+            text = await resp.text()
+            log_error(f"GitHub repos API error {resp.status}: {text[:200]}")
             raise RuntimeError(f"GitHub repos API error: {resp.status}")
         return await resp.json()
 
 
 # ============================================================
-#                  EVENT FILTERS
+# EVENT FILTERS
 # ============================================================
-
-
 def is_push_event(event: Dict[str, Any]) -> bool:
     return event.get("type") == "PushEvent"
 
@@ -122,48 +122,51 @@ def is_merge_event(event: Dict[str, Any]) -> bool:
 
 
 # ============================================================
-#                  FORMATTERS
+# FORMATTERS
 # ============================================================
-
-
 def format_push(event: Dict[str, Any]) -> str:
     repo = (event.get("repo") or {}).get("name", "unknown")
     commits = (event.get("payload") or {}).get("commits", [])
     if not commits:
         return f"📌 Новый push в <b>{repo}</b>"
-    commit_msgs = "\n".join(f"- {c['message']}" for c in commits)
-    return f"📌 Новый push в <b>{repo}</b>:\n{commit_msgs}"
+    commit_msgs = "\n".join(
+        f"• {c['message'][:50]}{'...' if len(c['message']) > 50 else ''}"
+        for c in commits[:3]
+    )
+    return f"📌 <b>Push в {repo}</b>\n<code>{commit_msgs}</code>"
 
 
 def format_repo_created(event: Dict[str, Any]) -> str:
-    repo = (event.get("repo") or {}).get("name")
-    return f"🆕 Создан репозиторий: <b>{repo}</b>"
+    repo = (event.get("repo") or {}).get("name", "unknown")
+    return f"🆕 <b>Создан репозиторий: {repo}</b>"
 
 
 def format_merged(event: Dict[str, Any]) -> str:
     pr = (event.get("payload") or {}).get("pull_request") or {}
     repo = pr.get("base", {}).get("repo", {}).get("full_name", "unknown")
-    title = pr.get("title", "")
-    number = pr.get("number", "")
+    title = pr.get("title", "")[:100]
+    number = pr.get("number", 0)
     url = pr.get("html_url", "")
-    return f"✅ Merge PR #{number} в <b>{repo}</b>\n📝 {title}\n🔗 {url}"
+    return f"✅ <b>Merged PR #{number}</b> в <code>{repo}</code>\n📝 {title}\n🔗 <a href='{url}'>Открыть PR</a>"
 
 
 def format_new_repo(repo: Dict[str, Any]) -> str:
+    name = repo.get("name", "unknown")
+    lang = repo.get("language", "не указан")
+    private = "private" if repo.get("private") else "public"
+    url = repo.get("html_url", "")
     return (
-        f"🆕 <b>Новый репозиторий</b>\n"
-        f"📦 {repo.get('name')}\n"
-        f"🗂 Язык: {repo.get('language')}\n"
-        f"🔒 Приватность: {'private' if repo.get('private') else 'public'}"
+        f"🆕 <b>Новый репозиторий: {name}</b>\n"
+        f"🗂 Язык: <code>{lang}</code>\n"
+        f"🔒 {private.title()}\n"
+        f"🔗 <a href='{url}'>Открыть репозиторий</a>"
     )
 
 
 # ============================================================
-#                MESSAGE BUILDER
+# MESSAGE BUILDER
 # ============================================================
-
-
-def build_messages(event: Dict[str, Any]) -> Optional[str]:
+def build_message(event: Dict[str, Any]) -> Optional[str]:
     if is_push_event(event):
         return format_push(event)
     if is_merge_event(event):
@@ -174,50 +177,52 @@ def build_messages(event: Dict[str, Any]) -> Optional[str]:
 
 
 # ============================================================
-#           FULL CHECK: EVENTS + NEW REPOSITORIES
+# MAIN LOGIC
 # ============================================================
+async def check_and_notify(bot: Bot, state: Dict[str, Any]) -> bool:
+    """Возвращает True если были уведомления"""
+    notified = False
 
-
-async def notify_new_events(bot: Bot) -> None:
-    log_info("Checking GitHub...")
-
-    state = load_state()
-    last_event_id = state.get("last_event_id")
-
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=10)
+    ) as session:
         events = await fetch_github_events(session)
         repos = await fetch_user_repos(session)
 
-    # --- Check new repos -------------------------------------
+    log_info(f"Found {len(repos)} repos, {len(events)} events")
+
+    # 1. Новые репозитории
     repo_names = {r["name"] for r in repos}
     old_repos = set(state.get("repos", []))
     new_repos = repo_names - old_repos
 
     if new_repos:
+        log_info(f"🆕 New repos: {new_repos}")
         for repo in repos:
             if repo["name"] in new_repos:
                 await bot.send_message(
                     chat_id=int(TELEGRAM_CHAT_ID),
                     text=format_new_repo(repo),
                     parse_mode="HTML",
+                    disable_web_page_preview=False,
                 )
+                notified = True
         state["repos"] = list(repo_names)
-        save_state(state)
-        log_info(f"New repositories detected: {new_repos}")
 
-    # --- Check events -----------------------------------------
-    new_events: List[Dict[str, Any]] = []
-    for e in events:
-        if last_event_id and e["id"] == last_event_id:
+    # 2. Новые события
+    last_event_id = state.get("last_event_id")
+    new_events = []
+
+    for event in events:
+        if last_event_id and event["id"] == last_event_id:
             break
-        new_events.append(e)
+        new_events.append(event)
 
-    if not new_events:
-        log_info("No new events.")
-    else:
-        new_events.reverse()
-        for e in new_events:
-            msg = build_messages(e)
+    if new_events:
+        log_info(f"📢 New events: {len(new_events)}")
+        new_events.reverse()  # Новые сверху
+        for event in new_events:
+            msg = build_message(event)
             if msg:
                 await bot.send_message(
                     chat_id=int(TELEGRAM_CHAT_ID),
@@ -225,59 +230,90 @@ async def notify_new_events(bot: Bot) -> None:
                     parse_mode="HTML",
                     disable_web_page_preview=True,
                 )
+                notified = True
+
         state["last_event_id"] = events[0]["id"]
+
+    if notified:
         save_state(state)
+        log_info("✅ Notifications sent")
+    else:
+        log_info("ℹ️ No new activity")
+
+    return notified
 
 
 # ============================================================
-#                     POLLER
+# POLLER
 # ============================================================
-
-
 async def poller(bot: Bot) -> None:
-    log_info("Initializing poller...")
+    log_info("🚀 Starting GitHub poller...")
 
+    # Инициализация состояния
     state = load_state()
 
     if not state.get("repos"):
+        log_info("📂 Initializing repos...")
         async with aiohttp.ClientSession() as session:
             repos = await fetch_user_repos(session)
-        state["repos"] = [r["name"] for r in repos]
-        save_state(state)
-        log_info("Initial repo list saved.")
+            state["repos"] = [r["name"] for r in repos]
+            save_state(state)
+        log_info(f"✅ Saved {len(state['repos'])} repos")
 
     if not state.get("last_event_id"):
+        log_info("📊 Initializing events...")
         async with aiohttp.ClientSession() as session:
             events = await fetch_github_events(session)
-        if events:
-            state["last_event_id"] = events[0]["id"]
-            save_state(state)
-            log_info("Initial last_event_id saved.")
+            if events:
+                state["last_event_id"] = events[0]["id"]
+                save_state(state)
+                log_info("✅ Events initialized")
 
+    cycle = 0
     while True:
+        cycle += 1
         try:
-            await notify_new_events(bot)
+            log_info(f"🔄 Cycle #{cycle} ({asyncio.get_event_loop().time():.0f})")
+            await check_and_notify(bot, state)
         except Exception as e:
-            log_error(str(e))
+            log_error(f"❌ Check failed: {e}")
+            import traceback
+
+            log_error(traceback.format_exc())
+
         await asyncio.sleep(POLL_INTERVAL)
 
 
 # ============================================================
-#                    START BOT
+# MAIN
 # ============================================================
-
-
 async def main() -> None:
-    log_info("Starting bot...")
+    log_info("🤖 Starting GitHub → Telegram bot...")
+
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     dp = Dispatcher()
 
-    log_info("Bot is running...")
+    # Тестовое сообщение
+    try:
+        await bot.send_message(
+            chat_id=int(TELEGRAM_CHAT_ID),
+            text="🚀 <b>GitHub Notify Bot started!</b>\nПроверки каждые "
+            + f"{POLL_INTERVAL}с на push/merge/новые репозитории.",
+            parse_mode="HTML",
+        )
+        log_info("✅ Test message sent")
+    except Exception as e:
+        log_error(f"❌ Test message failed: {e}")
 
-
+    # Запуск
     async with bot:
-        await asyncio.gather(dp.start_polling(bot), poller(bot))
+        await asyncio.gather(poller(bot), dp.start_polling(bot))
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log_info("👋 Bot stopped by user")
+    except Exception as e:
+        log_error(f"💥 Fatal error: {e}")
